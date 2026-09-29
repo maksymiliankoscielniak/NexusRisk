@@ -1,10 +1,9 @@
 /**
  * NexusRisk — Live Market Data Service
  *
- * Dev  → uses Vite's dev-server proxy at /yf (zero CORS, Node.js fetch)
- * Prod → tries a chain of free CORS proxies until one succeeds
+ * Fetches real-time ETF data from a public Google Sheet (acting as a free, 100% CORS-friendly API).
  *
- * ETF proxies:
+ * ETF mapping:
  *   Global Equities → SPY   (S&P 500)
  *   Tech Growth     → QQQ   (Nasdaq-100)
  *   Government Bonds → TLT  (20+ Year Treasury)
@@ -35,77 +34,8 @@ export type LiveMarketData = {
   errors:       string[];
 };
 
-/* ── URL strategy ─────────────────────────────────────────── */
-
-function yahooChartPath(ticker: string): string {
-  const now        = Math.floor(Date.now() / 1000);
-  const oneYearAgo = now - 365 * 24 * 3600;
-  return `/v8/finance/chart/${ticker}?interval=1d&period1=${oneYearAgo}&period2=${now}`;
-}
-
-function buildUrls(ticker: string): string[] {
-  const path      = yahooChartPath(ticker);
-  const directUrl = `https://query1.finance.yahoo.com${path}`;
-
-  if (import.meta.env.DEV) {
-    // Vite dev-server proxies /yf → query1.finance.yahoo.com (Node.js, no CORS)
-    return [`/yf${path}`];
-  }
-
-  // Production / GitHub Pages: try multiple free CORS proxies in order
-  return [
-    `https://corsproxy.io/?${encodeURIComponent(directUrl)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`,
-    `https://thingproxy.freeboard.io/fetch/${directUrl}`,
-    directUrl, // last-resort direct attempt (works if the user's browser has Yahoo cookies)
-  ];
-}
-
-/* ── Fetch helpers ────────────────────────────────────────── */
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const id = window.setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
-    promise.then(
-      (v) => { clearTimeout(id); resolve(v); },
-      (e) => { clearTimeout(id); reject(e); },
-    );
-  });
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractPrices(json: any): number[] {
-  if (json?.chart?.error) {
-    throw new Error(`Yahoo error: ${JSON.stringify(json.chart.error)}`);
-  }
-  const closes: (number | null)[] =
-    json?.chart?.result?.[0]?.indicators?.quote?.[0]?.close ?? [];
-  const prices = closes.filter((p): p is number => p !== null && isFinite(p));
-  if (prices.length < 30) {
-    throw new Error(`Only ${prices.length} prices — response may be empty or auth-blocked`);
-  }
-  return prices;
-}
-
-async function fetchDailyPrices(ticker: string): Promise<number[]> {
-  const urls = buildUrls(ticker);
-  const errs: string[] = [];
-
-  for (const url of urls) {
-    try {
-      const resp = await withTimeout(fetch(url), 13_000);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-      const json = await resp.json();
-      return extractPrices(json);
-    } catch (e) {
-      const msg = `[${url.slice(0, 40)}…]: ${(e as Error).message}`;
-      errs.push(msg);
-      console.warn(`[NexusRisk] ${ticker} strategy failed —`, (e as Error).message);
-    }
-  }
-
-  throw new Error(`All strategies failed for ${ticker}: ${errs.join(" | ")}`);
-}
+// Published Google Sheet CSV
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRkJPpn_LoJRMkI9xVpMIkQbt2YYnvCcseHyaldGMahYlKmKMpa6uGPNZLbmLzPNZuCFxZv4UWASQG2/pub?output=csv";
 
 /* ── Maths ────────────────────────────────────────────────── */
 
@@ -140,30 +70,79 @@ function correlation(a: number[], b: number[]): number {
 /* ── Public API ───────────────────────────────────────────── */
 
 let _cache: { data: LiveMarketData; ts: number } | null = null;
-const CACHE_TTL = 58_000; // just under 60s so the auto-refresh always gets fresh data
+const CACHE_TTL = 58_000; 
 
 export function clearCache() { _cache = null; }
 
 export async function fetchMarketData(): Promise<LiveMarketData> {
   if (_cache && Date.now() - _cache.ts < CACHE_TTL) return _cache.data;
 
+  // 1. Fetch the CSV from Google Sheets
+  const resp = await fetch(SHEET_CSV_URL);
+  if (!resp.ok) throw new Error(`Google Sheets HTTP ${resp.status}`);
+  const text = await resp.text();
+  
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length < 30) throw new Error("Not enough data from Google Sheets");
+
+  // 2. Parse the CSV columns (handling European locales with commas in numbers)
   const assetIds = Object.keys(TICKER_MAP) as AssetId[];
+  const series: Record<AssetId, number[]> = {
+    globalEquities: [],
+    techGrowth: [],
+    govBonds: [],
+    gold: [],
+    cash: []
+  };
 
-  // Fetch all tickers in parallel — partial success is OK
-  const results = await Promise.allSettled(
-    assetIds.map((id) => fetchDailyPrices(TICKER_MAP[id]))
-  );
+  // Skip the first row (headers)
+  for (let i = 1; i < lines.length; i++) {
+    const row: string[] = [];
+    let inQuotes = false;
+    let current = '';
+    
+    // Manual CSV split that ignores commas inside quotes
+    for (let char of lines[i]) {
+      if (char === '"') inQuotes = !inQuotes;
+      else if (char === ',' && !inQuotes) {
+        row.push(current);
+        current = '';
+      } else {
+        current += char;
+      }
+    }
+    row.push(current);
 
+    if (row.length >= 10) {
+       // Replace European decimal commas with dots and parse to float
+       const spy = parseFloat(row[1].replace(',', '.'));
+       const qqq = parseFloat(row[3].replace(',', '.'));
+       const tlt = parseFloat(row[5].replace(',', '.'));
+       const gld = parseFloat(row[7].replace(',', '.'));
+       const bil = parseFloat(row[9].replace(',', '.'));
+       
+       if (!isNaN(spy)) series.globalEquities.push(spy);
+       if (!isNaN(qqq)) series.techGrowth.push(qqq);
+       if (!isNaN(tlt)) series.govBonds.push(tlt);
+       if (!isNaN(gld)) series.gold.push(gld);
+       if (!isNaN(bil)) series.cash.push(bil);
+    }
+  }
+
+  // 3. Calculate Returns and Volatility
   const errors: string[] = [];
-  const returnSeries: (number[] | null)[] = results.map((r, i) => {
-    if (r.status === "fulfilled") return logReturns(r.value);
-    errors.push(`${TICKER_MAP[assetIds[i]]}: ${r.reason?.message ?? r.reason}`);
-    return null;
+  const returnSeries: (number[] | null)[] = assetIds.map(id => {
+    const s = series[id];
+    if (s.length < 30) {
+      errors.push(`Missing data for ${TICKER_MAP[id]}`);
+      return null;
+    }
+    return logReturns(s);
   });
 
   const successCount = returnSeries.filter(Boolean).length;
   if (successCount < 3) {
-    throw new Error(`Only ${successCount}/5 tickers succeeded: ${errors.join("; ")}`);
+    throw new Error(`Only ${successCount}/5 tickers succeeded from Sheets`);
   }
 
   const assets: Partial<Record<AssetId, LiveAssetData>> = {};
@@ -172,6 +151,7 @@ export async function fetchMarketData(): Promise<LiveMarketData> {
     if (rs) assets[id] = { expectedReturn: annualReturn(rs), volatility: annualVol(rs) };
   });
 
+  // 4. Calculate Correlation Matrix
   const corr: Partial<Record<AssetId, Partial<Record<AssetId, number>>>> = {};
   assetIds.forEach((idA, i) => {
     if (!returnSeries[i]) return;
