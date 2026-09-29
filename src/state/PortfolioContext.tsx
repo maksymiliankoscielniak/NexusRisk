@@ -127,7 +127,7 @@ function usePortfolioStore() {
       .catch((err) => {
         if (cancelled.current) return;
         console.warn("[NexusRisk] Market data fetch failed:", err?.message ?? err);
-        setDataError(err?.message ?? String(err));
+        setDataError(null);
         setDataStatus("mock");
       });
   }, []);
